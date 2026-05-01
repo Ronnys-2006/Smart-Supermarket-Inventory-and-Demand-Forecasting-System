@@ -3,13 +3,8 @@
 // It holds everything in an ArrayList<Product> which works because of
 // polymorphism - Grocery, Electronics etc. can all be stored as Product.
 //
-// I used the Singleton pattern here so there's only ever one instance
-// of this manager running. Creating multiple instances would cause
-// the inventory state to go out of sync.
-//
-// Note for JDBC team: this class doesn't touch the database directly.
-// It just manages the in-memory state. After any stock change here,
-// you need to sync it back to the DB using the queries mentioned in the comments.
+// Uses the Singleton pattern so there's only ever one instance
+// of this manager running.
 
 import java.util.ArrayList;
 import java.util.List;
@@ -19,9 +14,17 @@ public class InventoryManager {
     // Singleton instance.
     private static InventoryManager instance;
 
-    // Private constructor so nobody can do new InventoryManager() from outside.
+    // All products stored here.
+    private final ArrayList<Product> inventory;
+    
+    // NEW: Reference to the database manager
+    private DatabaseManager dbManager;
+
+    // Private constructor.
     private InventoryManager() {
         this.inventory = new ArrayList<>();
+        // NEW: Initialize the database connection when the manager is created
+        this.dbManager = new DatabaseManager();
     }
 
     // The only way to get the InventoryManager.
@@ -33,12 +36,15 @@ public class InventoryManager {
         return instance;
     }
 
-    // All products stored here. Using the base type Product so any subclass fits in.
-    // This is upcasting - a Grocery or Electronics object gets stored as Product.
-    private final ArrayList<Product> inventory;
+    // NEW: Initialize the inventory from the database on startup
+    public void loadInventoryFromDB() {
+        List<Product> productsFromDB = dbManager.loadAllProducts();
+        inventory.clear(); // Clear memory to avoid duplicates if called multiple times
+        inventory.addAll(productsFromDB);
+        System.out.println("Database Sync: Loaded " + inventory.size() + " products into memory.");
+    }
 
-    // Adds a product to the in-memory list.
-    // Called by the JDBC layer after reading a row from the products table.
+    // MODIFIED: Adds a product to memory AND the database.
     public void addProduct(Product product) {
         if (product == null) {
             System.err.println("Cannot add a null product.");
@@ -48,21 +54,41 @@ public class InventoryManager {
             System.err.println("Product ID '" + product.getProductId() + "' already exists. Skipping.");
             return;
         }
+        
+        // 1. Add to in-memory list
         inventory.add(product);
-        System.out.println("Added: " + product.getName() + " [" + product.getCategory() + "]");
+        
+        // 2. Sync with Database
+        boolean dbSuccess = dbManager.addProductDB(product);
+        if (dbSuccess) {
+            System.out.println("Added: " + product.getName() + " [" + product.getCategory() + "] (Synced to DB)");
+        } else {
+            inventory.remove(product);
+            System.err.println("Warning: Failed to save " + product.getName() + " to the database.");
+        }
     }
 
     // Removes a product from the list.
-    // JDBC team: after calling this, run DELETE FROM products WHERE product_id = ?
+    // Removes a product from the list and the database.
     public boolean removeProduct(String productId) {
         Product target = findProductById(productId);
         if (target == null) {
             System.err.println("Product ID '" + productId + "' not found.");
             return false;
         }
-        inventory.remove(target);
-        System.out.println("Removed: " + target.getName());
-        return true;
+        
+        // 1. Sync with Database FIRST
+        boolean dbSuccess = dbManager.removeProductDB(productId);
+        
+        // 2. If DB delete was successful, remove from Java memory
+        if (dbSuccess) {
+            inventory.remove(target);
+            System.out.println("Removed: " + target.getName() + " from memory and database.");
+            return true;
+        } else {
+            System.err.println("Warning: Failed to delete product from database.");
+            return false;
+        }
     }
 
     // Searches by product ID. Used internally and by the JDBC layer.
@@ -87,15 +113,25 @@ public class InventoryManager {
         return results;
     }
 
-    // Adds stock to a product and handles the exception if the amount is invalid.
-    // JDBC team: on success, run UPDATE products SET quantity = ? WHERE product_id = ?
+    // MODIFIED: Adds stock in memory and updates the DB.
     public boolean restockProduct(String productId, int amount) {
         Product product = findProductById(productId);
         try {
             if (product == null) {
                 throw new IllegalArgumentException("Product ID '" + productId + "' not found.");
             }
+            
+            // 1. In-memory update (Validation happens here)
             product.addStock(amount);
+            
+            // 2. Database Sync
+            boolean dbSuccess = dbManager.updateStockDB(productId, product.getQuantity());
+            if (!dbSuccess) {
+                // <-- ADD THIS CATCH to roll back memory
+                product.sellProduct(amount); // Reverts the addStock
+                System.err.println("Warning: Database sync failed. Restock reverted.");
+                return false; 
+            }
             return true;
 
         } catch (InvalidStockException e) {
@@ -107,22 +143,30 @@ public class InventoryManager {
             return false;
 
         } finally {
-            // finally block always runs - good for logging regardless of outcome.
             System.out.println("Restock operation finished for ID: " + productId);
         }
     }
 
-    // Records a sale by reducing stock and handles any stock-related exceptions.
-    // JDBC team: on success, run:
-    // 1. UPDATE products SET quantity = ? WHERE product_id = ?
-    // 2. INSERT INTO sales_history (product_id, quantity_sold, sale_date) VALUES (?, ?, NOW())
+    // MODIFIED: Records a sale in memory and updates both products and sales_history tables.
     public boolean recordSale(String productId, int amount) {
         Product product = findProductById(productId);
         try {
             if (product == null) {
                 throw new IllegalArgumentException("Product ID '" + productId + "' not found.");
             }
+            
+            // 1. In-memory update (Throws exception if not enough stock)
             product.sellProduct(amount);
+            
+            // 2. Database Sync (Handles transaction for stock update + sales history)
+            boolean dbSuccess = dbManager.recordSaleDB(productId, product.getQuantity(), amount);
+            
+            if (!dbSuccess) {
+                // Rollback in-memory if DB fails
+                product.addStock(amount); 
+                System.err.println("Database sync failed. Sale reverted in memory.");
+                return false;
+            }
             return true;
 
         } catch (InvalidStockException e) {
@@ -138,8 +182,7 @@ public class InventoryManager {
         }
     }
 
-    // Displays all products - each call to displayDetails() dispatches
-    // to the correct subclass method at runtime (dynamic dispatch).
+    // Displays all products.
     public void displayAllProducts() {
         if (inventory.isEmpty()) {
             System.out.println("Inventory is empty.");
@@ -152,7 +195,6 @@ public class InventoryManager {
     }
 
     // Filters and displays products by category.
-    // Uses instanceof before downcasting to avoid ClassCastException.
     public void displayByCategory(String category) {
         System.out.println("\nCategory: " + category);
         boolean found = false;
@@ -196,26 +238,35 @@ public class InventoryManager {
         }
     }
 
-    // Runs demand forecasting across all products that implement Forecastable.
-    // Uses instanceof to check before casting - safe downcast.
-    // JDBC team: pass in aggregate sales data from:
-    // SELECT SUM(quantity_sold) FROM sales_history WHERE sale_date >= ?
-    public void runForecastingForAll(int totalUnitsSold, int numberOfDays) {
-        System.out.println("\nDemand Forecast Report:");
+    // MODIFIED: Uses the database to get real historical sales data for forecasting.
+    // Removed the manual 'totalUnitsSold' parameter since we pull it directly now.
+    public void runForecastingForAll(int numberOfDays) {
+        System.out.println("\nDemand Forecast Report (Last " + numberOfDays + " Days):");
         for (Product p : inventory) {
             if (p instanceof Forecastable) {
                 Forecastable forecastable = (Forecastable) p;
-                forecastable.predictDemand(totalUnitsSold, numberOfDays);
+                
+                // Fetch actual historical units sold from sales_history table via DatabaseManager
+                int actualUnitsSold = dbManager.getSalesDataForForecasting(p.getProductId(), numberOfDays);
+                
+                forecastable.predictDemand(actualUnitsSold, numberOfDays);
             }
         }
     }
 
-    // Returns a copy of the inventory list so the internal list can't be modified directly.
+    // Returns a copy of the inventory list.
     public List<Product> getAllProducts() {
         return new ArrayList<>(inventory);
     }
 
     public int getInventorySize() {
         return inventory.size();
+    }
+    
+    // NEW: Safely close the database connection
+    public void shutdown() {
+        if (dbManager != null) {
+            dbManager.closeConnection();
+        }
     }
 }
