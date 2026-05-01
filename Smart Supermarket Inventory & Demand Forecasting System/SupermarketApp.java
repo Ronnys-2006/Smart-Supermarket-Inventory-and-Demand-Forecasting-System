@@ -233,8 +233,28 @@ public class SupermarketApp extends Application {
         TextField price = new TextField(); price.setPromptText("e.g. 45.0");
         TextField qty = new TextField(); qty.setPromptText("e.g. 50");
         ComboBox<String> category = new ComboBox<>(FXCollections.observableArrayList("Grocery", "Electronics", "Clothing", "Household"));
-        category.setValue("Grocery");
-        TextField attribute = new TextField(); attribute.setPromptText("Expiry(YYYY-MM-DD) or Warranty(Months)");
+category.setValue("Grocery");
+
+TextField attribute = new TextField(); 
+attribute.setPromptText("Expiry (YYYY-MM-DD)"); // Default since Grocery is selected first
+
+// NEW: Add a listener to change the text box hint when the dropdown changes
+category.setOnAction(e -> {
+    switch (category.getValue()) {
+        case "Grocery": 
+            attribute.setPromptText("Expiry (YYYY-MM-DD)"); 
+            break;
+        case "Electronics": 
+            attribute.setPromptText("Warranty (Months)"); 
+            break;
+        case "Clothing": 
+            attribute.setPromptText("Size (XS, S, M, L, XL)"); 
+            break;
+        case "Household": 
+            attribute.setPromptText("Material (e.g. Glass, Wood)"); 
+            break;
+    }
+});
 
         grid.add(new Label("Product ID:"), 0, 0); grid.add(id, 1, 0);
         grid.add(new Label("Name:"), 0, 1); grid.add(name, 1, 1);
